@@ -1,0 +1,889 @@
+---
+title: "Tarea Ridge,Lasso & Elastic-Net"
+format:
+  html:
+    self-contained: true
+editor: visual
+execute:
+  warning: false
+  error: false
+  message: false
+---
+
+```{r}
+load("C:/Users/Alex/Downloads/Variables 7.RData")
+```
+
+## Introducción
+
+BASE DE DATOS: Credit_risk_dataset
+
+FUENTE: Kaggle
+
+Integrantes : Alejandro Cañadas, Antonio Morcillo , Geovanny Jaramillo
+
+La base de datos escogida nos proporciona informacion financiera ,demográfica y específica acerca de la aprobación de préstamos. Diseñada con variables influyentes en el analisis de riesgo de crédito, nos permite hacer estudios, predicciones y en este caso un analisis de clasificación binaria sobre nuestra variable objetivo.
+
+Con regresión penalizada veremos cual es el modelo que mejor clasifica y predice nuestra variable target, que será el estado del préstamo, si bien ha sido aprobado por la entidad financiera o rechazado\
+\
+Variable target: Loan_status (1 approved, 0 rejected).
+
+## Estadísticos descriptivos
+
+Objetivo: Predecir estado de crédito a través de la evaluación de 3 modelos de regresión penalizada
+
+Tipo de problema: Supervisado, clasificación
+
+Variable target: Estado del préstamo (Loan_status)
+
+features: 12
+
+obsevaciones: 32.581
+
+## Análisis exploratorio
+
+```{r}
+library(tidymodels)
+library(dplyr)
+library(rsample)
+library(xgboost)
+library(parallel)
+library(doParallel)
+library(yardstick)
+library(vip)
+```
+
+```{r, eval= FALSE}
+#| echo: false
+getwd()
+setwd("C:\\Users\\Antonio\\Desktop\\ESTUDIOS\\Máster BIG DATA (EAE)\\Asignaturas\\Estadística y minería de datos\\Actividad\\Estudio de Riesgo de Impago de Crédito - Alejandro, Antonio, Geovanny\\credit_risk_dataset.csv")
+```
+
+```{r}
+# Código en el chunk
+dim(loan_data)      # Dimensiones
+names(loan_data)    # Nombres de las columnas
+str(loan_data)      # Estructura de los datos
+```
+
+You can add options to executable code like this
+
+```{r}
+summary(loan_data)
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+Tenemos todo tipo de features en esta base de datos tanto numericas como factores, ordinales y nominales que tendremos que tratar para poder incluirlas
+
+```{r}
+str(loan_data)
+```
+
+La distribución es claramente asimétrica hacia la derecha. Aunque la mediana este por debajo de los 10.000\$, hay muchos outliers a la derecha
+
+```{r}
+
+plot1 <- ggplot(loan_data, aes(x = loan_amnt)) + 
+  geom_histogram(bins=50, col= "White") 
+plot2 <- ggplot(loan_data, aes(y = loan_amnt)) + 
+  geom_boxplot()+coord_flip()
+gridExtra::grid.arrange(plot1, plot2)
+
+```
+
+Tras aplicar logaritmos vemos que la transformación es demasiado fuerte
+
+```{r}
+loan_data$loan_amnt_log <- log10(loan_data$loan_amnt)
+
+plot1 <- ggplot(loan_data, aes(x = loan_amnt_log)) + 
+  geom_histogram(bins=50, col= "White") 
+plot2 <- ggplot(loan_data, aes(y = loan_amnt_log)) + 
+  geom_boxplot()+coord_flip()
+gridExtra::grid.arrange(plot1, plot2)
+```
+
+Con la raís cuadráda la transformación sigue siendo demasiado fuerte asi que con la raíz cúbica la distribución queda más simetrica
+
+```{r}
+loan_data$loan_amnt_cbrt <- loan_data$loan_amnt^(1/3)
+
+plot1 <- ggplot(loan_data, aes(x = loan_amnt_cbrt)) + 
+  geom_histogram(bins=50, col= "White") 
+plot2 <- ggplot(loan_data, aes(y = loan_amnt_cbrt)) + 
+  geom_boxplot()+coord_flip()
+gridExtra::grid.arrange(plot1, plot2)
+```
+
+Analisis de la variable loan_status. La mayoria de prestamos son rechazados
+
+```{r}
+loan_data |>
+  count(loan_status) |>
+  mutate(percentage = n / sum(n) * 100)
+
+```
+
+Ahora agrupado por la intención del proposito de préstamo:
+
+Los prestamos con mayor % de aprobación son medical, home improvement y medical
+
+```{r}
+loan_data_summary_intent <- loan_data |>
+  group_by(loan_intent) |>
+  summarise(
+    total_loans = n(),
+    approved_loans_intent = sum(loan_status == 1),
+    rejected_loans_intent = sum(loan_status == 0),
+    approval_rate_intent = mean(loan_status == 1),
+    rejection_rate_intent = mean(loan_status == 0)
+  );loan_data_summary_intent
+```
+
+Tratamiento de variables y recipe
+
+Comprobamos si hay valores vacios . Hay valores nulos solo en dos columnas, ambas numéricas.
+
+Tras hacer la transformación comprobamos que no haya valores nulos
+
+```{r}
+# Eliminar valores nulos
+sum(is.na(loan_data))
+colSums(is.na(loan_data)) #Suma de valores nulos
+
+loan_data[loan_data == ""] <- NA
+
+sum(is.na(loan_data$person_emp_length)) #Comprobación
+sum(is.na(loan_data$loan_int_rate))
+```
+
+Convertir variables categóricas en factores
+
+```{r}
+nominal_features <- c('person_home_ownership','cb_person_default_on_file','loan_intent')
+ordinal_features <- c('loan_grade')
+numeric_predictors <- loan_data |> select(where(is.numeric))
+
+loan_data$person_home_ownership <- as.factor(loan_data$person_home_ownership)
+loan_data$cb_person_default_on_file <- as.factor(loan_data$cb_person_default_on_file)
+loan_data$loan_intent <- as.factor(loan_data$loan_intent)
+loan_data$loan_status <- as.factor(loan_data$loan_status)
+```
+
+Loan_grade a factor ordenado
+
+```{r}
+loan_data <- loan_data|>
+  mutate(loan_grade = factor(loan_grade, levels =c('A','B','C','D','E','F','G'),ordered = TRUE))
+```
+
+Pasamos a hacer el data splitting en training y test y fijamos semilla. Dedicamos un 70% de los datos a training y 30% a test para evitar el overfitting.
+
+```{r}
+library(rsample)
+set.seed(123)
+loan_split <- initial_split(loan_data, prop = 0.7)
+loan_train <- training(loan_split)
+loan_test <- testing(loan_split)
+```
+
+## Paso 2 Recipe
+
+Elaboramos la recipe con los pasos del data engineering
+
+```{r}
+loan_recipe <- recipe(loan_status~.,data=loan_data)|>
+  step_nzv(all_predictors())|>
+  step_naomit(all_predictors()) |>
+  step_integer(all_ordered_predictors()) |>
+  step_other(all_nominal_predictors(), threshold = 0.01) |>
+  step_impute_knn(all_predictors(), neighbors = 5) |>
+  step_ordinalscore(all_ordered_predictors())|>
+  #Como no tenemos ninguna variables con demasiados niveles no usamos step_other para agrupar
+  step_dummy(all_nominal_predictors(),one_hot=FALSE)|>
+  step_YeoJohnson(all_numeric_predictors())|>
+  step_normalize(all_numeric_predictors())
+#al no haber altas correlaciones no aplicamos PCA 
+```
+
+Y aplicamos receta
+
+```{r}
+loan_recipe_prepared <- prep(loan_recipe, training = loan_data)
+transformed_data <- bake(loan_recipe_prepared, new_data = NULL)  
+
+```
+
+Para asegurar que ha funcionado vemos los datos normalizados y que ahora son numericos todos los features:
+
+```{r}
+head (transformed_data)
+```
+
+```{r}
+str(transformed_data)
+```
+
+## Paso 3 Creamos modelos y workflow
+
+Modelos Ridge,Lasso y Elastic-Net a tunear
+
+```{r}
+ridge_model <- logistic_reg(penalty=tune(),mixture=0)|>
+  set_engine("glmnet")|>
+  set_mode("classification")
+lasso_model <- logistic_reg(penalty = tune(), mixture = 1) |> 
+  set_engine("glmnet")|>
+  set_mode("classification")
+elastic_net_model <- logistic_reg(penalty = tune(), mixture = tune()) |> 
+  set_engine("glmnet")|>
+  set_mode("classification")
+```
+
+Creamos workflows
+
+```{r}
+ridge_workflow <- workflow()|>
+  add_model(ridge_model)|>
+  add_recipe(loan_recipe)
+
+lasso_workflow <- workflow() |> 
+  add_model(lasso_model) |> 
+  add_recipe(loan_recipe)
+
+# Workflow para Elastic Net
+elastic_net_workflow <- workflow() |> 
+  add_model(elastic_net_model) |> 
+  add_recipe(loan_recipe)
+```
+
+Generamos los grids para tunear lambda (la penalización)
+
+```{r}
+grid_ridge_tune <- grid_max_entropy(
+  extract_parameter_set_dials(ridge_workflow),
+  size = 50)
+
+grid_lasso_tune <- grid_max_entropy(
+  extract_parameter_set_dials(lasso_workflow),
+  size = 50)
+
+grid_elastic_net_tune <- grid_max_entropy(
+  extract_parameter_set_dials(elastic_net_workflow),
+  size = 50)
+```
+
+## Paso 4 Realizamos la validación cruzada dividiendo en folds
+
+Realizamos la validación cruzada tuneando los grids
+
+Además añadimos las métricas de clasificación: Roc-Auc, F1 score, accuracy, Precision,Sensitivity, Spec
+
+```{r, eval= FALSE}
+set.seed(123)  
+loan_cvrep <- rsample::vfold_cv(data = loan_train, 
+                                v = 5, 
+                                repeats = 5, 
+                                strata = loan_status)
+ctrl <- control_resamples(event_level = "second")
+metricas <- metric_set(roc_auc,f_meas,accuracy, precision, sens, spec)
+
+# Ajuste de hiperparametros 
+ridge_reg_tune <-tune_grid(ridge_workflow, 
+                           loan_cvrep, 
+                           grid = grid_ridge_tune, 
+                           metrics = metricas,
+                           control = ctrl)
+
+lasso_reg_tune <-tune_grid(lasso_workflow, 
+                           loan_cvrep, 
+                           grid = grid_lasso_tune, 
+                           metrics = metricas,
+                           control = ctrl)
+
+elastic_net_tune <- tune_grid(elastic_net_workflow,
+                              loan_cvrep,
+                              grid = grid_elastic_net_tune,
+                              metrics = metricas,
+                              control = ctrl)
+```
+
+Ahora seleccionamos el mejor valor de landa segun el roc_auc y vemos las métricas
+
+```{r}
+best_ridge <- select_best(ridge_reg_tune, metric = "roc_auc")
+best_lasso <- select_best(lasso_reg_tune, metric = "roc_auc")
+best_elastic_net <- select_best(elastic_net_tune, metric = "roc_auc")
+
+ridge_metrics <- ridge_reg_tune |> collect_metrics();print(ridge_metrics)
+lasso_metrics <- lasso_reg_tune |> collect_metrics();print(lasso_metrics)
+elastic_net_metrics <- elastic_net_tune |> collect_metrics();print(elastic_net_metrics)
+```
+
+Vemos que nos dan los tres modelos metricas muy parecidas en cuanto ROC-AUC , en torno al 0.85, es decir tiene esa probabilidad de distinguir entre clase positiva (credito aprobado) y negativas (crédito denegado).
+
+Finalizamos el modelo con los mejores hiperparámetros y lo entrenamos con el conjunto training
+
+```{r}
+final_ridge_wf <- finalize_workflow(ridge_workflow,best_ridge);final_ridge_wf
+final_lasso_wf <- finalize_workflow(lasso_workflow, best_lasso);final_lasso_wf
+final_elastic_wf <- finalize_workflow(elastic_net_workflow, best_elastic_net);final_elastic_wf
+
+# Entrena el modelo final
+final_ridge_fit <- fit(final_ridge_wf, data = loan_train)
+final_lasso_fit <- fit(final_lasso_wf, data = loan_train)
+final_elastic_fit <- fit(final_elastic_wf, data = loan_train)
+```
+
+## Paso 5 Nuevo assessment
+
+Realizamos de nuevo la validación cruzada, esta vez sin tunear
+
+```{r, eval= FALSE}
+set.seed(123)
+loan_cv_final <- rsample::vfold_cv(
+  data = loan_train, v = 5, repeats= 10,
+  strata = loan_status)
+
+ctrl <- control_resamples(event_level = "second")
+metricas <- metric_set(roc_auc, f_meas, accuracy, precision, sens, spec)
+
+
+ridge_assessment <- fit_resamples(
+  final_ridge_wf,
+  resamples = loan_cv_final,
+  metrics = metricas,
+  control = ctrl)
+
+lasso_assessment <- fit_resamples(
+  final_lasso_wf,
+  resamples = loan_cv_final,
+  metrics = metricas,
+  control = ctrl)
+
+
+elastic_assessment <- fit_resamples(
+  final_elastic_wf,
+  resamples = loan_cv_final,
+  metrics = metricas,
+  control = ctrl)
+
+ridge_metrics_asses1 <- collect_metrics(ridge_assessment)
+lasso_metrics_asses1 <- collect_metrics(lasso_assessment)
+elastic_metrics_asses1 <- collect_metrics(elastic_assessment)
+
+```
+
+Vemos los resultados:
+
+Son métricas muy similares a las del tuneo
+
+Varían muy levemente los resultamos en sensitivity y precision.
+
+```{r}
+ridge_metrics_asses1
+
+lasso_metrics_asses1
+
+elastic_metrics_asses1
+```
+
+## Paso 6 Prediccion conjunto test de elastic-net
+
+ROC AUC y F1 elegiremos elastic - net ya que es la que mejor valor toma roc-auc y f1
+
+Primero calculamos las predicciones sobre el conjunto test
+
+```{r}
+# Este código genera predicciones soft (type="prob") para el modelo final, genera probabilidades de pertenencia a cada clase por lo que representan las probabilidades para las clases "No" (0) y "Yes" (1)
+# De esta forma no genera la prediccion final pero si nos permite ajustar el ubral de probabilidad
+ridge_test_preds <- predict(final_ridge_fit, loan_test, type = "prob");ridge_test_preds
+lasso_test_preds <- predict(final_lasso_fit, loan_test, type = "prob");lasso_test_preds
+elastic_test_preds <- predict(final_elastic_fit, loan_test, type = "prob");elastic_test_preds
+```
+
+Esto no genera la prediccion final pero si nos permite ajustar el umbral de probabilidad, que en nuestro dataset es más bajo que al azar (0.5)
+
+A continuacón para establecer el umbral queremos saber el numero de casos positivo que hay en la columna loan_status que será muy similar a la media de las predicciones.
+
+```{r}
+prop_positivos <- mean(loan_train$loan_status == 1)
+print(prop_positivos)
+
+# Lo que nos da 0.2168 por tanto hay cerca de 22% positivos y 78% negativos en el test
+# Usamos esa porporcion como umbral
+best_threshold <- 0.2155573
+```
+
+0.21 será nuestro umbral.
+
+Primero homogeneizamos como factor y asegurando que los datos tienen los mismo niveles
+
+```{r}
+elastic_test_preds <- elastic_test_preds |> 
+  mutate(preds = if_else(.pred_1 > best_threshold, 1, 0)) |> 
+  mutate(preds = factor(preds, levels = c(0, 1), labels = c("No", "Yes")))
+
+loan_test <- loan_test |> 
+  mutate(loan_status = factor(loan_status, levels = c(0, 1), labels = c("No", "Yes")))
+elastic_test_preds
+```
+
+Finalmente calculamos las métricas para el conjunto de prueba
+
+```{r}
+metricas <- metric_set(accuracy, f_meas, roc_auc, precision, sens, spec)
+
+elastic_test_metrics <- elastic_test_preds |> 
+  bind_cols(truth = loan_test$loan_status) |> 
+  metricas(truth = truth, estimate = preds, .pred_1)
+```
+
+```{r}
+print(elastic_test_metrics)
+
+```
+
+He intentado ver porque la metricas Roc - Auc sale tan baja pero no he conseguido solucionarlo. Es una base con variable target muy desbalanceada 80%-20% y por tanto tambien las predicciones .
+
+Pero al hacerlas en el penúltimo paso no he visto nada mal y no he podido justificarlo.
+
+Un dato así de la métrica ROC- AUC es muy negativo e indicaría que el modelo no sabe predecir. El resto de métricas aumentan en la mayoría de casos pero podría ser engañoso aunque nos de valores alto.
+
+## Modelo Boosting
+
+Definimos el modelo de boosting con 500 árboles, diferentes profundidades y tasas de aprendizaje
+
+```{r, eval= FALSE}
+library(xgboost)
+
+boost_model <- boost_tree(trees = 500, 
+                          tree_depth = 1,2,4,
+                          learn_rate = 0.01,
+                          loss_reduction = 0.001,0.01,0.1,
+                          min_n = 20) |> 
+set_engine("xgboost") |> 
+set_mode("classification")
+```
+
+Creamos el workflow para el modelo de boosting combinando la receta y el modelo
+
+```{r}
+# Workflow boosting
+loan_workflow <- workflow() |>
+  add_recipe(loan_recipe) |>  
+  add_model(boost_model)  
+```
+
+Entrenamos el modelo de boosting utilizando los datos de entrenamiento.
+
+```{r}
+# Entrenar el modelo 
+boost_fit <- loan_workflow |>
+  fit(data = loan_train)
+
+boost_fit
+```
+
+Log loss de 0.68 a 0.22, el modelo fue entrenado correctamente con 500 iteraciones utilizando 19 características. La pérdida (logloss) disminuyó significativamente, lo que indica que el modelo se ajustó bien a los datos de entrenamiento.
+
+## Modelo Boosting con tuneado.
+
+Definimos el modelo de Boosting con la sintonización de parámetros.
+
+```{r, eval= FALSE}
+boost_model_tune <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(), 
+  min_n = tune(), 
+  learn_rate = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+```
+
+Creamos el workflow para el modelo de boosting con parámetros sintonizados.
+
+```{r}
+wflow_boost_tune <- workflow() |>
+  add_model(boost_model_tune) |>
+  add_recipe(loan_recipe)  
+```
+
+Extraemos el conjunto de parámetros para sintonizar
+
+```{r}
+wflow_boost_tune_param  <- extract_parameter_set_dials(wflow_boost_tune)
+```
+
+Definimos el grid para el tuning del modelo de boosting.
+
+```{r}
+grid_boost_tune <- expand.grid(
+  trees = c(1000, 2000),  # Número de árboles
+  tree_depth = c(1, 2, 4), 
+  min_n = c(20, 50),    # Observaciones por nodo
+  learn_rate = c(0.001, 0.01, 0.1))
+
+print(grid_boost_tune)
+```
+
+Configuramos la validación cruzada y realizamos el tuning del modelo de boosting
+
+```{r, eval= FALSE}
+set.seed(123)
+k1 <- 5; k2 <- 1
+attr_cvrep <- rsample::vfold_cv(loan_train, v = k1, repeats = k2)
+ctrl <- control_grid(event_level = "second") 
+metricas <- metric_set(accuracy, sens, precision, f_meas, spec, roc_auc, detection_prevalence)
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+boost_reg_tune <- tune_grid(wflow_boost_tune,
+                            attr_cvrep,
+                            grid = grid_boost_tune,
+                            metrics = metricas,
+                            control = ctrl)
+stopCluster(cl)
+boost_reg_tune |> collect_metrics()
+```
+
+Seleccionamos la mejor combinación de hiperparámetros según la métrica ROC AUC y mostramos los hiperparámetros seleccionados. Y filtramos las métricas para la configuración óptima.
+
+```{r}
+best_params_boost <- select_best(boost_reg_tune, metric = "roc_auc")  
+print(best_params_boost)
+
+best_config <- best_params_boost$.config
+```
+
+Filtramos las métricas según los mejores hiperparámetros de roc_auc y mostramos los resultados.
+
+```{r}
+best_boost_metrics <- boost_reg_tune|>
+  collect_metrics() |>
+  filter(.config == best_config)
+
+best_boost_metrics
+```
+
+Definimos modelo con mejores hiperparámetros y lo integramos al workflow.
+
+```{r}
+final_boost_spec <- boost_tree(
+  trees = best_params_boost$trees,
+  min_n = best_params_boost$min_n,
+  tree_depth = best_params_boost$tree_depth,
+  learn_rate = best_params_boost$learn_rate
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+```
+
+Creamos el workflow con el mejor modelo.
+
+```{r}
+final_boost_workflow <- workflow() |>
+  add_model(final_boost_spec) |>
+  add_recipe(loan_recipe)
+```
+
+Entrenamos el modelo con los datos del entrenamiento.
+
+```{r, eval= FALSE}
+final_boost_fit <- final_boost_workflow |>
+  fit(data = loan_train)
+```
+
+Hacemos predicciones y las convertimos a 'Yes' y 'No'.
+
+```{r}
+predictions <- predict(final_boost_fit, new_data = loan_test, type = "class")
+
+#"Yes" y "No"
+predictions <- predictions |>
+  mutate(.pred_class = ifelse(.pred_class == 1, "Yes", "No")) |>
+  mutate(.pred_class = factor(.pred_class, levels = c("No", "Yes")))
+```
+
+Creamos un dataframe con las predicciones y valores reales.
+
+```{r}
+results <- loan_test |>
+  select(loan_status) |>
+  bind_cols(predictions)
+```
+
+Definimos el conjunto de métricas y las calculamos juntas y las mostramos.
+
+```{r}
+metrics <- metric_set(accuracy, sens, spec, precision, f_meas, detection_prevalence)
+
+# Cálculo
+model_metrics <- results |>
+  metrics(truth = loan_status, estimate = .pred_class,event_level = "second")
+
+# Métricas.
+print(model_metrics)
+```
+
+Aumenta accuracy con respecto a elastic-net en un 17%.
+
+Se mantiene igual f_meas, precisión y sensibilidad.
+
+Especificidad aumenta en un 20%
+
+-   **VIP**
+
+Verificamos si la librería 'vip' está instalada, si no, la instalamos.
+
+```{r}
+if (!requireNamespace("vip", quietly = TRUE)) {
+  install.packages("vip")
+}
+```
+
+Seleccionamos los mejores hiperparámetros del grid de tuning.
+
+```{r}
+best_params <- grid_boost_tune[1, ]
+```
+
+Definimos el modelo XGBoost con los mejores hiperparámetros, y entrenamos el modelo con los datos de entrenamiento (loan_train).
+
+```{r}
+boost_model <- boost_tree(
+  trees = best_params$trees,
+  tree_depth = best_params$tree_depth,
+  min_n = best_params$min_n,
+  learn_rate = best_params$learn_rate
+) |> 
+  set_engine("xgboost", colsample_bytree = 1) |> 
+  set_mode("classification")
+
+boost_fit <- boost_model |> 
+  fit(loan_status ~ ., data = loan_train)
+```
+
+Obtenemos la matriz de importancia de las variables y lo graficamos con vip.
+
+```{r}
+importance_matrix <- xgboost::xgb.importance(model = extract_fit_engine(boost_fit))
+print(importance_matrix)
+```
+
+```{r}
+vip::vip(extract_fit_engine(boost_fit), num_features = max(20, nrow(importance_matrix))) +  
+  ggtitle("Importancia de Variables - XGBoost") +
+  theme_minimal()
+```
+
+## Modelo SVM.
+
+Empezamos fijando la semilla para reproducibilidad y definimos la validación cruzada con 5 particiones y 1 repetición.
+
+```{r}
+set.seed(123)
+loan_cvrp <- rsample::vfold_cv(loan_train, v = 5,  repeats = 1)
+```
+
+Definimos el modelo SVM lineal con un parámetro cost de 5, creamos el workflow uniendo la receta de preprocesamiento y el modelo de SVM. Finalmente definimos el conjunto de métricas.
+
+```{r}
+svmlin_loan_model <- svm_linear(cost = 5) |> 
+  set_engine("kernlab")  |>
+  set_mode("classification")
+svmlin_wf <- workflow() |>
+  add_recipe(loan_recipe) |> 
+  add_model(svmlin_loan_model)
+ctrl <- control_resamples(event_level = "second")
+```
+
+```{r, eval= FALSE}
+perf_metr_loan <- metric_set(accuracy, detection_prevalence, sens, precision, f_meas, spec, roc_auc)
+asses1_loan_cvrp <- fit_resamples(svmlin_wf,
+                                  resamples = loan_cvrp,
+                                  metrics = perf_metr_loan,
+                                  control = ctrl)
+collect_metrics(asses1_loan_cvrp)
+```
+
+-   **Modelo Radial**
+
+Definimos el modelo SVM con kernel radial y creamos el workflow con la receta de preprocesamiento y el modelo SVM radial.
+
+```{r}
+svmrb_model <- svm_rbf(cost = 1, rbf_sigma = 0.01) |> 
+  set_engine("kernlab")  |>
+  set_mode("classification")
+svmrb_wf <- workflow() |> 
+  add_recipe(loan_recipe) |> 
+  add_model(svmrb_model)
+```
+
+Evaluamos el modelo SVM radial usando validación cruzada. Y mostramos las métricas de evaluación.
+
+```{r, eval= FALSE}
+asses3_loan_cvrp <- fit_resamples(svmrb_wf,
+                                  resamples = loan_cvrp,
+                                  metrics = perf_metr_loan,
+                                  control = ctrl)
+collect_metrics(asses3_loan_cvrp)
+```
+
+-   El modelo radial da mejores métricas
+
+-   **Modelo tuneado.**
+
+Definimos el modelo SVM con kernel radial, tuneando 'cost' y 'rbf_sigma'. Y creamos el workflow.
+
+```{r}
+# Generamos grid
+svmrb_model_tune <- svm_rbf(cost = tune(), rbf_sigma = tune()) |> 
+  set_engine("kernlab")  |>
+  set_mode("classification")
+
+```
+
+```{r}
+svmrb_wf_tune <- workflow() |> 
+  add_recipe(loan_recipe) |> 
+  add_model(svmrb_model_tune)
+```
+
+Extraemos los hiperparámetros, generamos el grid y lo mostramos.
+
+```{r, eval= FALSE}
+svmrb_wf_tune_param  <- extract_parameter_set_dials(svmrb_wf_tune)
+grid_svmrb_wf_tune <- expand.grid(cost = cost() |> 
+                                    value_seq(n = 5, original = TRUE), 
+                                  rbf_sigma = rbf_sigma() |> 
+                                    value_seq(n = 5, original = TRUE))
+
+cost()
+rbf_sigma()
+grid_svmrb_wf_tune
+```
+
+Configuramos la paralelización y utilizamos todos los núcleos menos 2.
+
+```{r}
+cl <- makePSOCKcluster(parallel::detectCores() - 2)
+registerDoParallel(cl)
+```
+
+Configuramos el control del proceso de tuneado. Y ejecutamos la sintonización de hiperparámetros mediante validación cruzada.
+
+```{r, eval= FALSE}
+ctrl_tune <- control_grid(save_pred = TRUE, verbose = TRUE)
+
+# Ejecutar tuning con validación cruzada
+svmrb_tune_results <- tune_grid(
+  svmrb_wf_tune,
+  resamples = loan_cvrp,
+  grid = grid_svmrb_wf_tune,
+  metrics = perf_metr_loan,
+  control = ctrl_tune
+)
+```
+
+Detenemos la paralelización y mostramos las métricas.
+
+```{r}
+stopCluster(cl)
+
+svmrb_tune_results |>
+  collect_metrics()
+```
+
+Seleccionamos la mejor combinación de hiperparámetros basándonos en la métrica roc_auc, filtramos las métricas obtenidas para la combinación óptima de cost y rbf_sigma. Finalmente mostramos las métricas asociadas a los mejores hiperparámetros.
+
+```{r}
+best_params_svm <- select_best(svmrb_tune_results, metric = "roc_auc")  
+print(best_params_svm)
+
+# Filtro métricas
+best_svm_metrics <- svmrb_tune_results |>
+  collect_metrics() |>
+  filter(cost == best_params_svm$cost, rbf_sigma == best_params_svm$rbf_sigma)
+
+# Resultados
+print(best_svm_metrics)
+```
+
+Definimos los modelo con mejores hiperparámetros y los integramos al workflow.
+
+```{r}
+final_svm_model <- svm_rbf(cost = best_params_svm$cost, 
+                           rbf_sigma = best_params_svm$rbf_sigma) |>
+  set_engine("kernlab") |>
+  set_mode("classification")
+
+# Workflow con el mejor modelo
+final_svm_wf <- workflow() |>
+  add_recipe(loan_recipe) |>
+  add_model(final_svm_model)
+```
+
+Entrenamos el modelo con los datos de entrenamiento.
+
+```{r, eval= FALSE}
+final_svm_fit <- final_svm_wf |>
+  fit(data = loan_train)
+```
+
+Hacemos predicciones con el modelo ajustado sobre el conjunto de prueba.
+
+```{r}
+svm_predictions <- final_svm_fit |>
+  predict(new_data = loan_test) |>
+  bind_cols(loan_test) 
+```
+
+Convertimos las predicciones de 0/1 a factores "No" y "Yes"
+
+```{r}
+svm_predictions <- svm_predictions |>
+  mutate(
+    .pred_class = ifelse(.pred_class == 1, "Yes", "No"),  # Transformar valores
+    .pred_class = factor(.pred_class, levels = c("No", "Yes"))  # Convertir a factor con niveles correctos
+  )
+```
+
+Convertimos la variable loan_status en un factor con los mismos niveles que las predicciones, y verificamos que los niveles de ambas variables sean los mismos .
+
+```{r}
+svm_predictions <- svm_predictions |>
+  mutate(
+    loan_status = factor(loan_status, levels = c("No", "Yes"))
+  )
+print(levels(svm_predictions$.pred_class))
+print(levels(svm_predictions$loan_status))
+```
+
+Definimos el conjunto de métricas para evaluar el rendimiento del modelo, calculamos estas métricas y mostramos los resultados finales.
+
+```{r}
+# Definir las métricas que queremos calcular
+metricas_completas <- metric_set(accuracy, sens, spec, precision, f_meas, detection_prevalence)
+
+# Calcular todas las métricas usando la probabilidad de "Yes"
+final_metrics <- svm_predictions |>
+  metricas_completas(truth = loan_status, estimate = .pred_class, 
+                     prob = .pred_Yes)  # <-- Aquí usamos la probabilidad
+
+# Mostrar métricas finales
+print(final_metrics)
+```
+
+La accuracy baja un 4% con respecto al boosting.
+
+Sensibilidad sube a 0,97, es decir, un 24%. Y f_meas también.
+
+Se mantienen precisión y detención de prevalencia.
+
+Sin embargo, en este modelo se ve perjudicada la especificidad a 0,61.
+
+**CONCLUSIÓN**
+
+-   Podemos denotar que 2 modelos NO lineales tienen una mayor sensibilidad y precisión, que para el estudio del default de crédito es relevante.
